@@ -1,0 +1,135 @@
+-- **Role ENUM**
+-- Defines the possible roles a user can have: student, instructor, or admin.
+-- ENUM is used for data integrity and simplicity, as roles are static and limited.
+CREATE TYPE role_type AS ENUM ('Student', 'Instructor', 'Admin');
+
+-- 1. Accounts Table
+CREATE TABLE Accounts (
+    account_id SERIAL PRIMARY KEY,
+    ssn VARCHAR(11) UNIQUE,
+    name VARCHAR(100) NOT NULL,
+    dob DATE NOT NULL,
+    primary_email VARCHAR(255) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL
+);
+-- Reasoning: This table is the central identity store for all users (students, instructors, admins). 
+-- The `account_id` ensures fast lookups, while `UNIQUE` constraints on `ssn` and `primary_email` 
+-- prevent duplicates. The `password_hash` field stores secure credentials.
+
+-- 2. Schools Table
+CREATE TABLE Schools (
+    school_id SERIAL PRIMARY KEY,
+    school_name VARCHAR(100) NOT NULL
+);
+-- Reasoning: A simple table to manage multiple schools. The `school_id` is the primary key 
+-- for efficient referencing in other tables.
+
+-- 3. EnrollmentPeriods Table
+CREATE TABLE EnrollmentPeriods (
+    period_id SERIAL PRIMARY KEY,
+    school_id INT REFERENCES Schools(school_id) ON DELETE CASCADE,
+    name VARCHAR(100) NOT NULL,
+    start_date DATE NOT NULL,
+    end_date DATE NOT NULL
+);
+-- Reasoning: Organizes enrollment terms by school, crucial for separating student data by term 
+-- for analytics. The `ON DELETE CASCADE` ensures that if a school is removed, its enrollment 
+-- periods are also deleted.
+
+-- 4. AccessCards Table
+CREATE TABLE AccessCards (
+    accesscard_id SERIAL PRIMARY KEY,
+    account_id INT REFERENCES Accounts(account_id),
+    school_id INT REFERENCES Schools(school_id) ON DELETE SET NULL,
+    email VARCHAR(255) NOT NULL,
+    global BOOLEAN DEFAULT FALSE,
+    role role_type NOT NULL
+);
+-- Reasoning: Links accounts to specific schools and roles, allowing multiple emails per person 
+-- (one per school). The `global` flag means the account has this accessCard for all schools rather than a single one.
+
+-- 5. Enrollments Table
+CREATE TABLE Enrollments (
+    enrollment_id SERIAL PRIMARY KEY,
+    accesscard_id INT REFERENCES AccessCards(accesscard_id),
+    period_id INT REFERENCES EnrollmentPeriods(period_id) ON DELETE CASCADE,
+    start_date DATE NOT NULL,
+    end_date DATE NOT NULL
+);
+-- Reasoning: Connects students to specific enrollment periods (terms). The `start_date` and 
+-- `end_date` are embedded to avoid frequent joins with `EnrollmentPeriods`, optimizing performance. 
+
+-- 6. Permissions Table
+CREATE TABLE Permissions (
+    permission_id SERIAL PRIMARY KEY,
+    type VARCHAR(50) NOT NULL,
+    resource VARCHAR(100),  -- specify the page (e.g., 'dashboard', 'reports') if type: 'page'
+    rules JSONB NOT NULL,
+    access BOOLEAN NOT NULL
+);
+CREATE OR REPLACE FUNCTION check_access(
+    p_type VARCHAR(50),
+    p_role role_type,
+    p_school_name VARCHAR(100),
+    p_email VARCHAR(255),
+    p_account_id INTEGER
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    perm RECORD;
+    rule JSONB;
+    condition_parts TEXT[];
+    all_conditions_met BOOLEAN;
+BEGIN
+    -- Fetch the single permission for the given type
+    SELECT * INTO perm FROM Permissions WHERE type = p_type;
+    IF NOT FOUND THEN
+        RETURN FALSE;  -- No permission found, deny access
+    END IF;
+
+    -- Loop through each rule in the rules array
+    FOR rule IN SELECT jsonb_array_elements(perm.rules->'rules') LOOP
+        condition_parts := string_to_array(rule->>'condition', ' AND ');
+        all_conditions_met := TRUE;
+
+        -- Check each part of the condition
+        FOREACH part IN ARRAY condition_parts LOOP
+            CASE part
+                WHEN 'roles' THEN
+                    IF NOT ('any' = ANY((rule->>'roles')::TEXT[]) OR p_role::TEXT = ANY((rule->>'roles')::TEXT[])) THEN
+                        all_conditions_met := FALSE;
+                    END IF;
+                WHEN 'schools' THEN
+                    IF p_school_name IS NOT NULL AND NOT ('any' = ANY((rule->>'schools')::TEXT[]) OR p_school_name = ANY((rule->>'schools')::TEXT[])) THEN
+                        all_conditions_met := FALSE;
+                    END IF;
+                WHEN 'emails' THEN
+                    IF NOT (p_email = ANY((rule->>'emails')::TEXT[])) THEN
+                        all_conditions_met := FALSE;
+                    END IF;
+                WHEN 'accounts' THEN
+                    IF NOT (p_account_id = ANY((rule->>'accounts')::INTEGER[])) THEN
+                        all_conditions_met := FALSE;
+                    END IF;
+                ELSE
+                    RAISE EXCEPTION 'Invalid condition part: %', part;
+            END CASE;
+        END LOOP;
+
+        -- If all conditions in this rule are met, return the access value
+        IF all_conditions_met THEN
+            RETURN perm.access;
+        END IF;
+    END LOOP;
+
+    -- No rules satisfied, deny access
+    RETURN FALSE;
+END;
+$$ LANGUAGE plpgsql;
+-- The Permissions table works in tandem with the check_access function to evaluate whether a user can access a resource. Here’s the process:
+
+Single Record per Type: For a given type (e.g., 'page'), there is exactly one Permissions record. The check_access function fetches this record.
+Rules Evaluation: The rules JSONB column contains an array of rules (e.g., [{"condition": "roles", "roles": ["instructor"]}, {"condition": "schools", "schools": ["School A"]}]). The function checks each rule:
+Within a Rule: If the rule’s condition is a combination (e.g., "roles AND schools"), all parts must be true (e.g., user must be an "instructor" AND from "School A").
+Between Rules: Rules are combined with OR logic—satisfying any one rule triggers the access value.
+Access Outcome: If any rule is satisfied, the function returns the access boolean (TRUE for granted, FALSE for denied). If no rules are satisfied, it returns FALSE (deny by default).
