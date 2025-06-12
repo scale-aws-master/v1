@@ -5,6 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "dev:local": "NODE_ENV=development node -r dotenv/config server.js dotenv_config_path=.env.local",
+    "client": "cd client && npm start",
     "dev": "nodemon server.js",
     "build": "cd client && npm install && npm run build",
     "postinstall": "npm run build"
@@ -20,4 +22,4 @@
   "devDependencies": {
     "nodemon": "^3.0.2"
   }
-}  
+}      
